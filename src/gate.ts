@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import type { Bus } from "./bus.js";
 import { type Db, logEvent } from "./db.js";
 
 export interface ApprovalRequest {
@@ -72,6 +73,29 @@ export function primaryInput(toolName: string, input: Record<string, unknown>): 
   }
 }
 
+/**
+ * One line describing what is being asked for, for a push notification or a
+ * narrow phone screen.
+ *
+ * The bridge does not always populate `title` -- live testing showed a Bash
+ * call arriving with `displayName: "Bash"` and `title: null` -- so this walks
+ * down to progressively cruder sources rather than trusting any single field.
+ */
+export function approvalSummary(
+  req: Pick<ApprovalRequest, "toolName" | "title" | "displayName" | "description">,
+  subject: string,
+): string {
+  if (req.title) return truncate(req.title, 160);
+  const label = req.displayName ?? req.toolName;
+  if (subject) return truncate(`${label}: ${subject}`, 160);
+  return truncate(req.description ?? label, 160);
+}
+
+function truncate(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
 function ruleMatches(rule: RuleRow, toolName: string, subject: string): boolean {
   if (rule.tool_name !== "*" && rule.tool_name !== toolName) return false;
   switch (rule.match_kind) {
@@ -92,33 +116,21 @@ interface Waiter {
   timer: NodeJS.Timeout;
 }
 
-export type GateListener = (event: { kind: string; approvalId: string; sessionId: string }) => void;
-
 export class ApprovalGate {
   readonly #db: Db;
+  readonly #bus: Bus;
   readonly #ttlMs: number;
   readonly #waiters = new Map<string, Waiter>();
-  readonly #listeners = new Set<GateListener>();
   #closed = false;
 
-  constructor(db: Db, ttlMs: number) {
+  constructor(db: Db, bus: Bus, ttlMs: number) {
     this.#db = db;
+    this.#bus = bus;
     this.#ttlMs = ttlMs;
   }
 
-  onEvent(listener: GateListener): () => void {
-    this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
-  }
-
-  #emit(kind: string, approvalId: string, sessionId: string): void {
-    for (const l of this.#listeners) {
-      try {
-        l({ kind, approvalId, sessionId });
-      } catch {
-        // A bad listener must never wedge a permission decision.
-      }
-    }
+  #emit(kind: string, approvalId: string, sessionId: string, data?: Record<string, unknown>): void {
+    this.#bus.emit(kind, sessionId, { approvalId, ...data });
   }
 
   #matchRule(sessionId: string, toolName: string, subject: string): RuleRow | undefined {
@@ -206,7 +218,10 @@ export class ApprovalGate {
     logEvent(this.#db, req.sessionId, "approval.pending", {
       approvalId: id, toolName: req.toolName, subject,
     });
-    this.#emit("approval.pending", id, req.sessionId);
+    this.#emit("approval.pending", id, req.sessionId, {
+      toolName: req.toolName,
+      summary: approvalSummary(req, subject),
+    });
 
     return new Promise<PermissionResult>((resolvePromise) => {
       let settled = false;

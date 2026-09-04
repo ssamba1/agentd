@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="agentd">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" href="/icon.png">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<title>agentd</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+  --fg:#e6e9ef; --dim:#9aa3b2; --faint:#6b7383;
+  --accent:#6ea8fe; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+  --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;overscroll-behavior-y:none;
+}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer;border:none;background:none}
+a{color:var(--accent)}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+#app{display:flex;flex-direction:column;height:100dvh}
+
+header{
+  display:flex;align-items:center;gap:10px;padding:calc(10px + var(--safe-t)) 14px 10px;
+  background:var(--panel);border-bottom:1px solid var(--line);flex:0 0 auto;
+}
+header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+header .sp{flex:1}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+.dot.on{background:var(--ok)}
+.dot.off{background:var(--bad)}
+.iconbtn{padding:7px 10px;border-radius:8px;color:var(--dim);font-size:13px}
+.iconbtn:active{background:var(--panel2)}
+
+main{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:12px}
+
+nav{
+  display:flex;background:var(--panel);border-top:1px solid var(--line);flex:0 0 auto;
+  padding-bottom:var(--safe-b);
+}
+nav button{
+  flex:1;padding:10px 4px;color:var(--faint);font-size:11px;
+  display:flex;flex-direction:column;align-items:center;gap:3px;
+}
+nav button.sel{color:var(--accent)}
+nav .glyph{font-size:17px;line-height:1}
+.badge{
+  position:absolute;transform:translate(11px,-6px);background:var(--bad);color:#fff;
+  border-radius:9px;padding:0 5px;font-size:10px;font-weight:700;line-height:15px;min-width:15px;
+}
+
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  margin:10px 12px;padding:12px 14px;
+}
+.card h3{margin:0 0 8px;font-size:14px;font-weight:650}
+.row{display:flex;align-items:center;gap:8px}
+.muted{color:var(--dim);font-size:13px}
+.faint{color:var(--faint);font-size:12px}
+.empty{text-align:center;color:var(--faint);padding:48px 24px;font-size:14px}
+
+.pill{
+  display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
+  font-weight:600;background:var(--panel2);color:var(--dim);
+}
+.pill.running{background:#1e3a5f;color:#8ab4f8}
+.pill.idle{background:#2a2f3a;color:var(--dim)}
+.pill.completed{background:#14351f;color:var(--ok)}
+.pill.failed,.pill.interrupted{background:#3d1a1a;color:var(--bad)}
+
+.btn{
+  padding:11px 14px;border-radius:10px;background:var(--panel2);
+  color:var(--fg);font-size:14px;font-weight:600;border:1px solid var(--line);
+}
+.btn:active{opacity:.7}
+.btn.primary{background:var(--accent);color:#0b1220;border-color:transparent}
+.btn.ok{background:var(--ok);color:#07130c;border-color:transparent}
+.btn.bad{background:var(--bad);color:#1a0808;border-color:transparent}
+.btn.wide{width:100%}
+.btn:disabled{opacity:.4}
+
+.field{
+  width:100%;padding:11px 12px;border-radius:10px;background:var(--panel2);
+  border:1px solid var(--line);color:var(--fg);
+}
+textarea.field{resize:vertical;min-height:76px}
+
+/* approval inbox */
+.ap{border-left:3px solid var(--warn)}
+.ap .tool{font-weight:700;font-size:13px;color:var(--warn)}
+.ap pre{
+  background:var(--bg);border:1px solid var(--line);border-radius:8px;
+  padding:9px 10px;margin:8px 0;font-size:12px;overflow-x:auto;white-space:pre-wrap;
+  word-break:break-word;max-height:220px;
+}
+.ap .acts{display:flex;gap:8px;margin-top:10px}
+.ap .acts .btn{flex:1;padding:12px 8px}
+.remember{margin-top:8px;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim)}
+.remember input{width:16px;height:16px;accent-color:var(--accent)}
+
+/* chat */
+.msg{margin:10px 12px}
+.msg .who{font-size:11px;color:var(--faint);margin-bottom:3px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.msg .body{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;white-space:pre-wrap;word-break:break-word}
+.msg.user .body{background:#1c2740;border-color:#26374f}
+.tool-line{
+  margin:6px 12px;padding:7px 10px;border-radius:9px;background:var(--panel2);
+  border:1px solid var(--line);font-size:12px;color:var(--dim);cursor:pointer;
+  display:flex;align-items:center;gap:7px;
+}
+.tool-line .caret{color:var(--faint);font-size:10px}
+.tool-detail{margin:0 12px 8px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 10px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+
+.composer{
+  display:flex;gap:8px;padding:10px 12px calc(10px + var(--safe-b));
+  background:var(--panel);border-top:1px solid var(--line);align-items:flex-end;
+}
+.composer textarea{flex:1;min-height:42px;max-height:140px;padding:10px 12px;border-radius:12px;background:var(--panel2);border:1px solid var(--line);resize:none}
+.composer button{padding:11px 13px;border-radius:12px;background:var(--panel2);border:1px solid var(--line)}
+.composer button.send{background:var(--accent);color:#0b1220;border-color:transparent;font-weight:700}
+.composer button.rec{background:var(--bad);color:#fff;border-color:transparent}
+
+/* diff */
+.dfile{border:1px solid var(--line);border-radius:10px;margin:8px 12px;overflow:hidden}
+.dfile .hd{display:flex;align-items:center;gap:8px;padding:9px 11px;background:var(--panel);cursor:pointer}
+.dfile .nm{flex:1;font-size:12.5px;word-break:break-all}
+.dfile .st{font-size:11px;font-weight:700;width:16px;text-align:center}
+.plus{color:var(--ok);font-size:11px;font-weight:700}
+.minus{color:var(--bad);font-size:11px;font-weight:700}
+.hunk{margin:0;padding:8px 0;background:var(--bg);font-size:11.5px;overflow-x:auto;border-top:1px solid var(--line)}
+.hunk div{padding:0 11px;white-space:pre;min-height:1.45em}
+.hunk .a{background:#0f2a17;color:#a7e8bd}
+.hunk .d{background:#2c1214;color:#f2b0b0}
+.hunk .h{color:var(--faint)}
+
+#term{padding:8px 6px}
+.xterm{padding:4px}
+
+.toast{
+  position:fixed;left:50%;transform:translateX(-50%);bottom:calc(74px + var(--safe-b));
+  background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  padding:10px 16px;border-radius:10px;font-size:13px;z-index:50;max-width:88vw;
+  box-shadow:0 8px 28px rgba(0,0,0,.5);
+}
+
+@media (min-width:820px){
+  .card,.msg,.dfile{margin-left:auto;margin-right:auto;max-width:760px}
+  .composer{padding-left:calc(50vw - 380px);padding-right:calc(50vw - 380px)}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="dot" id="conn" title="live connection"></span>
+    <h1 id="title">agentd</h1>
+    <span class="sp"></span>
+    <button class="iconbtn" id="back" hidden>‹ Back</button>
+  </header>
+  <main id="view"></main>
+  <nav id="nav"></nav>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

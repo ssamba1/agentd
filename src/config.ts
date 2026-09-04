@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Credentials that outrank CLAUDE_CODE_OAUTH_TOKEN in Claude Code's
@@ -131,6 +132,10 @@ export interface Config {
   model: string | undefined;
   /** Hard ceiling on agentic turns per session. */
   maxTurns: number;
+  /** Directory the PWA is served from. */
+  publicDir: string;
+  /** VAPID `sub` claim. Must be a mailto: or https: URL. */
+  pushContact: string;
 }
 
 function intFromEnv(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -156,5 +161,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowSimulate,
     model: env["AGENTD_MODEL"] || undefined,
     maxTurns: intFromEnv(env, "AGENTD_MAX_TURNS", 200),
+    publicDir: resolve(env["AGENTD_PUBLIC_DIR"] ?? fileURLToPath(new URL("../public", import.meta.url))),
+    pushContact: env["AGENTD_PUSH_CONTACT"] ?? "mailto:agentd@localhost",
   };
 }

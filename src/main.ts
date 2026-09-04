@@ -1,8 +1,14 @@
+import type { Duplex } from "node:stream";
+import { Bus } from "./bus.js";
 import { auditCredentialEnvironment, CredentialEnvironmentError, loadConfig } from "./config.js";
 import { openDb, reapOrphanedApprovals, reapOrphanedSessions } from "./db.js";
 import { ApprovalGate } from "./gate.js";
 import { createHttpServer } from "./http.js";
+import { createPtySocket } from "./pty.js";
+import { PushService } from "./push.js";
 import { SessionManager } from "./session.js";
+import { createSqliteSessionStore } from "./sessionStore.js";
+import { createEventSocket } from "./ws.js";
 
 function main(): void {
   const cfg = loadConfig();
@@ -22,9 +28,38 @@ function main(): void {
     );
   }
 
-  const gate = new ApprovalGate(db, cfg.approvalTtlMs);
-  const sessions = new SessionManager(db, cfg, gate);
-  const server = createHttpServer({ db, cfg, gate, sessions, startedAt: Date.now() });
+  const bus = new Bus();
+  const gate = new ApprovalGate(db, bus, cfg.approvalTtlMs);
+  const store = createSqliteSessionStore(db);
+  const sessions = new SessionManager(db, cfg, gate, bus, store);
+  const push = new PushService(db, bus, cfg.pushContact);
+  const server = createHttpServer({
+    db,
+    cfg,
+    gate,
+    sessions,
+    push,
+    publicDir: cfg.publicDir,
+    startedAt: Date.now(),
+  });
+
+  // Two WebSocket endpoints share one HTTP server, so upgrade routing is done
+  // here rather than letting each WebSocketServer race for the event and
+  // destroy sockets meant for the other.
+  const events = createEventSocket(bus, db);
+  const pty = createPtySocket(db, cfg.workRoot);
+
+  server.on("upgrade", (req, socket: Duplex, head) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (url.pathname === "/ws") {
+      events.handleUpgrade(req, socket, head, (ws) => events.emit("connection", ws, req));
+    } else if (url.pathname === "/pty") {
+      const cwd = pty.resolveCwd(url.searchParams.get("session"), url.searchParams.get("cwd"));
+      pty.wss.handleUpgrade(req, socket, head, (ws) => pty.wss.emit("connection", ws, req, cwd));
+    } else {
+      socket.destroy();
+    }
+  });
 
   // The SDK warns once if canUseTool would be shadowed by the permission
   // config. We run 'default' + empty allowlist precisely so it is not, so if
@@ -42,7 +77,7 @@ function main(): void {
     console.log(`[agentd] db=${cfg.dbPath} approvalTtl=${cfg.approvalTtlMs / 1000}s`);
     console.log(
       `[agentd] auth=${audit.tokenPresent ? "CLAUDE_CODE_OAUTH_TOKEN" : "NONE (simulate only)"}` +
-        `${cfg.allowSimulate ? " simulate=on" : ""}`,
+        ` push=${push.enabled ? "on" : "off"}${cfg.allowSimulate ? " simulate=on" : ""}`,
     );
   });
 
@@ -53,20 +88,19 @@ function main(): void {
     console.log(`[agentd] shutting down (${reason})`);
 
     // Order matters: deny parked approvals first so subprocesses unblock and
-    // can exit, then abort the sessions, then close the socket and the db.
+    // can exit, then abort the sessions, then close the sockets and the db.
     const denied = gate.shutdown();
     if (denied) console.log(`[agentd] denied ${denied} parked approval(s)`);
     sessions.shutdown();
+    for (const client of events.clients) client.terminate();
+    for (const client of pty.wss.clients) client.terminate();
 
-    server.close(() => {
+    const finish = (): void => {
       db.close();
       process.exit(process.exitCode ?? 0);
-    });
-    // Don't hang forever on a stuck connection.
-    setTimeout(() => {
-      db.close();
-      process.exit(process.exitCode ?? 0);
-    }, 5000).unref();
+    };
+    server.close(finish);
+    setTimeout(finish, 5000).unref();
   }
 
   process.on("SIGINT", () => shutdown("SIGINT"));

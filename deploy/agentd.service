@@ -1,0 +1,53 @@
+[Unit]
+Description=agentd -- self-hosted Claude Code control plane
+Documentation=https://code.claude.com/docs/en/agent-sdk/hosting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentd
+Group=agentd
+WorkingDirectory=/opt/agentd
+
+# The subscription token lives here and nowhere else: chmod 600, root-owned,
+# never in the repo and never baked into an image.
+#   install -o root -g agentd -m 0640 /dev/null /etc/agentd/claude.env
+#   printf 'CLAUDE_CODE_OAUTH_TOKEN=%%s\n' "$TOKEN" > /etc/agentd/claude.env
+EnvironmentFile=/etc/agentd/claude.env
+Environment=AGENTD_HOST=127.0.0.1
+Environment=AGENTD_PORT=8787
+Environment=AGENTD_DB=/var/lib/agentd/agentd.db
+Environment=AGENTD_WORK_ROOT=/var/lib/agentd/work
+Environment=AGENTD_APPROVAL_TTL_SEC=1800
+
+ExecStart=/usr/bin/node /opt/agentd/dist/main.js
+
+# SIGTERM makes agentd deny every parked approval before exiting, so no
+# subprocess is left blocked on a promise that will never settle.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=5
+
+# agentd exits 78 (EX_CONFIG) on a credential-audit failure. Restarting on a
+# misconfigured environment just loops, so treat it as terminal.
+RestartPreventExitStatus=78
+
+StateDirectory=agentd
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentd
+
+[Install]
+WantedBy=multi-user.target

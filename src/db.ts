@@ -4,9 +4,7 @@ import { dirname } from "node:path";
 
 export type Db = Database.Database;
 
-const SCHEMA_VERSION = 1;
-
-const SCHEMA = `
+const V1 = `
 CREATE TABLE sessions (
   id             TEXT PRIMARY KEY,
   sdk_session_id TEXT,
@@ -14,7 +12,7 @@ CREATE TABLE sessions (
   cwd            TEXT NOT NULL,
   prompt         TEXT NOT NULL,
   status         TEXT NOT NULL CHECK (status IN
-                   ('starting','running','completed','failed','interrupted')),
+                   ('starting','running','idle','completed','failed','interrupted')),
   error          TEXT,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
@@ -30,8 +28,6 @@ CREATE TABLE approvals (
   tool_use_id     TEXT,
   tool_name       TEXT NOT NULL,
   input_json      TEXT NOT NULL,
-  -- Presentation metadata handed to us by the SDK. Render the inbox from
-  -- these rather than reconstructing prompt text from tool_name + input.
   title           TEXT,
   display_name    TEXT,
   description     TEXT,
@@ -50,13 +46,11 @@ CREATE INDEX approvals_pending_idx ON approvals(status, created_at);
 CREATE INDEX approvals_session_idx ON approvals(session_id, created_at DESC);
 
 -- Standing rules. These, not the SDK's allowedTools, are the source of truth
--- for auto-approval: the session runs with permissionMode 'default' and an
--- empty allowlist so that every tool call reaches canUseTool and is matched
--- here. That keeps the rules editable at runtime instead of frozen at
--- query() construction.
+-- for auto-approval: sessions run with permissionMode 'default' and an empty
+-- allowlist so every tool call reaches canUseTool and is matched here. That
+-- keeps rules editable at runtime instead of frozen at query() construction.
 CREATE TABLE rules (
   id          TEXT PRIMARY KEY,
-  -- NULL scope means the rule applies to every session.
   session_id  TEXT REFERENCES sessions(id),
   tool_name   TEXT NOT NULL,
   match_kind  TEXT NOT NULL CHECK (match_kind IN ('any','prefix','exact')),
@@ -78,6 +72,51 @@ CREATE TABLE events (
 CREATE INDEX events_session_idx ON events(session_id, id);
 `;
 
+const V2 = `
+ALTER TABLE sessions ADD COLUMN repo TEXT;
+ALTER TABLE sessions ADD COLUMN branch TEXT;
+ALTER TABLE sessions ADD COLUMN worktree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN project_key TEXT;
+
+-- Durable mirror of session transcripts, written through the SDK's
+-- SessionStore interface. Local JSONL dies with the container; this is what
+-- options.resume reads back after a restart.
+CREATE TABLE session_entries (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_key TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  subpath     TEXT NOT NULL DEFAULT '',
+  uuid        TEXT,
+  entry       TEXT NOT NULL,
+  ts          INTEGER NOT NULL
+);
+CREATE INDEX session_entries_key_idx ON session_entries(project_key, session_id, subpath, id);
+-- SQLite treats NULLs as distinct in a UNIQUE index, so entries without a
+-- uuid (titles, tags, mode markers) always append while entries with one are
+-- deduped. That is exactly the contract the SDK asks adapters to implement.
+CREATE UNIQUE INDEX session_entries_uuid_idx
+  ON session_entries(project_key, session_id, subpath, uuid);
+
+CREATE TABLE push_subscriptions (
+  id         TEXT PRIMARY KEY,
+  endpoint   TEXT NOT NULL UNIQUE,
+  p256dh     TEXT NOT NULL,
+  auth       TEXT NOT NULL,
+  label      TEXT,
+  created_at INTEGER NOT NULL,
+  last_ok_at INTEGER,
+  failures   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE app_config (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+const MIGRATIONS: string[] = [V1, V2];
+const SCHEMA_VERSION = MIGRATIONS.length;
+
 export function openDb(path: string): Db {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -86,14 +125,18 @@ export function openDb(path: string): Db {
   db.pragma("synchronous = NORMAL");
 
   const current = db.pragma("user_version", { simple: true }) as number;
-  if (current === 0) {
-    db.exec(SCHEMA);
-    db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  } else if (current !== SCHEMA_VERSION) {
+  if (current > SCHEMA_VERSION) {
     throw new Error(
-      `Database at ${path} is schema version ${current}, this build expects ` +
-        `${SCHEMA_VERSION}. No migration path exists yet -- move the file aside.`,
+      `Database at ${path} is schema version ${current}, newer than this build ` +
+        `(${SCHEMA_VERSION}). Downgrading is not supported.`,
     );
+  }
+  for (let v = current; v < SCHEMA_VERSION; v++) {
+    const sql = MIGRATIONS[v]!;
+    db.transaction(() => {
+      db.exec(sql);
+      db.pragma(`user_version = ${v + 1}`);
+    })();
   }
   return db;
 }
@@ -108,42 +151,51 @@ export function openDb(path: string): Db {
  * Nothing else cleans these up.
  */
 export function reapOrphanedApprovals(db: Db, now = Date.now()): number {
-  const result = db
+  return db
     .prepare(
       `UPDATE approvals
-          SET status = 'abandoned',
-              decided_by = 'shutdown',
-              decided_at = ?,
+          SET status = 'abandoned', decided_by = 'shutdown', decided_at = ?,
               deny_message = 'agentd restarted while this approval was pending'
         WHERE status = 'pending'`,
     )
-    .run(now);
-  return result.changes;
+    .run(now).changes;
 }
 
 /**
- * Sessions are subprocesses. They do not survive a restart either. Resuming
- * them is a Phase 2 concern (SessionStore + options.resume); for now, mark
- * them honestly rather than leaving zombies in the dashboard.
+ * Subprocesses do not survive a restart. Sessions whose transcript was mirrored
+ * to session_entries can be resumed on demand; the rest are dead. Either way
+ * they are not running right now, so stop claiming they are.
  */
 export function reapOrphanedSessions(db: Db, now = Date.now()): number {
-  const result = db
+  return db
     .prepare(
       `UPDATE sessions
           SET status = 'interrupted',
               error = COALESCE(error, 'agentd restarted while this session was running'),
               updated_at = ?
-        WHERE status IN ('starting','running')`,
+        WHERE status IN ('starting','running','idle')`,
     )
-    .run(now);
-  return result.changes;
+    .run(now).changes;
 }
 
-export function logEvent(db: Db, sessionId: string | null, kind: string, payload: unknown): void {
-  db.prepare(`INSERT INTO events (session_id, ts, kind, payload) VALUES (?, ?, ?, ?)`).run(
-    sessionId,
-    Date.now(),
-    kind,
-    JSON.stringify(payload ?? null),
+export function logEvent(db: Db, sessionId: string | null, kind: string, payload: unknown): number {
+  return Number(
+    db
+      .prepare(`INSERT INTO events (session_id, ts, kind, payload) VALUES (?, ?, ?, ?)`)
+      .run(sessionId, Date.now(), kind, JSON.stringify(payload ?? null)).lastInsertRowid,
   );
+}
+
+export function getConfigValue(db: Db, key: string): string | undefined {
+  const row = db.prepare(`SELECT value FROM app_config WHERE key = ?`).get(key) as
+    | { value: string }
+    | undefined;
+  return row?.value;
+}
+
+export function setConfigValue(db: Db, key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO app_config (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(key, value);
 }

@@ -90,11 +90,35 @@ const MAX_PATCH_BYTES = 400_000;
 export async function diffWorkspace(cwd: string): Promise<DiffSummary> {
   if (!(await isGitRepo(cwd))) return { files: [], patch: "", truncated: false };
 
-  const [numstat, nameStatus, patch] = await Promise.all([
+  // `git diff HEAD` does not see untracked files, so a session whose whole
+  // contribution is new files would show an empty diff. Reviewing changes and
+  // silently missing every added file is the worst way for this to be wrong,
+  // so untracked paths are folded in explicitly.
+  //
+  // --intent-to-add would be simpler but mutates the index, and this is a
+  // read-only view of someone else's working tree.
+  const [numstat, nameStatus, tracked, untrackedList] = await Promise.all([
     git(cwd, ["diff", "HEAD", "--numstat"]).catch(() => ""),
     git(cwd, ["diff", "HEAD", "--name-status"]).catch(() => ""),
     git(cwd, ["diff", "HEAD"]).catch(() => ""),
+    git(cwd, ["ls-files", "--others", "--exclude-standard"]).catch(() => ""),
   ]);
+
+  const untracked = untrackedList.split("\n").filter(Boolean);
+  const extraPatches: string[] = [];
+  const extraFiles: DiffSummary["files"] = [];
+  for (const path of untracked.slice(0, 200)) {
+    // --no-index against the null device produces a normal-looking patch for a
+    // file git does not track yet. It exits non-zero when there is a
+    // difference, which is the expected case, so failure is not an error here.
+    const patch = await git(cwd, ["diff", "--no-index", "--", NULL_DEVICE, path]).catch(
+      (err: { stdout?: string }) => err.stdout ?? "",
+    );
+    const added = patch ? patch.split("\n").filter((l) => l.startsWith("+")).length - 1 : 0;
+    extraFiles.push({ path, added: Math.max(0, added), removed: 0, status: "A" });
+    if (patch) extraPatches.push(normalizeNoIndexPatch(patch, path));
+  }
+  const patch = [tracked, ...extraPatches].filter(Boolean).join("\n");
 
   const statusByPath = new Map<string, string>();
   for (const line of nameStatus.split("\n").filter(Boolean)) {
@@ -118,8 +142,20 @@ export async function diffWorkspace(cwd: string): Promise<DiffSummary> {
 
   const truncated = Buffer.byteLength(patch) > MAX_PATCH_BYTES;
   return {
-    files,
+    files: [...files, ...extraFiles],
     patch: truncated ? patch.slice(0, MAX_PATCH_BYTES) : patch,
-    truncated,
+    truncated: truncated || untracked.length > 200,
   };
+}
+
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+
+/**
+ * `git diff --no-index` writes the null device as the "a" side, which the
+ * client's per-file patch splitter cannot map back to a path. Rewrite the
+ * header so an untracked file reads like any other addition.
+ */
+function normalizeNoIndexPatch(patch: string, path: string): string {
+  const body = patch.split("\n").slice(1).join("\n");
+  return `diff --git a/${path} b/${path}\n${body}`;
 }

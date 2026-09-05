@@ -94,6 +94,7 @@ export class SessionManager {
   readonly #store: SessionStore;
   readonly #mcp: McpPolicy;
   readonly #live = new Map<string, LiveSession>();
+  #stopping = false;
 
   constructor(
     db: Db,
@@ -233,7 +234,8 @@ export class SessionManager {
         }),
     };
 
-    this.#setStatus(id, "running");
+    // Clear any error from a previous run: this session is alive again.
+    this.#setStatus(id, "running", undefined, true);
     try {
       for await (const message of query({ prompt: input, options })) {
         this.#record(id, message);
@@ -241,11 +243,15 @@ export class SessionManager {
       this.#setStatus(id, "completed");
       this.#bus.emit("session.completed", id);
     } catch (err) {
-      const aborted = abort.signal.aborted;
       const text = err instanceof Error ? err.message : String(err);
-      this.#setStatus(id, aborted ? "interrupted" : "failed", text);
-      logEvent(this.#db, id, aborted ? "session.interrupted" : "session.failed", { error: text });
-      this.#bus.emit(aborted ? "session.interrupted" : "session.failed", id, { error: text });
+      // The child is in agentd's process group, so on shutdown it takes the
+      // signal before our abort fires and the SDK reports a plain non-zero
+      // exit. Without #stopping that gets filed as a genuine failure, which
+      // then survives in the UI as a red session nobody actually broke.
+      const interrupted = abort.signal.aborted || this.#stopping || /code 143|SIGTERM/.test(text);
+      this.#setStatus(id, interrupted ? "interrupted" : "failed", text);
+      logEvent(this.#db, id, interrupted ? "session.interrupted" : "session.failed", { error: text });
+      this.#bus.emit(interrupted ? "session.interrupted" : "session.failed", id, { error: text });
     } finally {
       input.close();
       this.#live.delete(id);
@@ -285,10 +291,19 @@ export class SessionManager {
     }
   }
 
-  #setStatus(id: string, status: string, error?: string): void {
+  /**
+   * `clearError` exists because COALESCE(?, error) alone can only ever add an
+   * error, never retract one -- a resumed session would keep displaying the
+   * failure that killed its previous run.
+   */
+  #setStatus(id: string, status: string, error?: string, clearError = false): void {
     this.#db
-      .prepare(`UPDATE sessions SET status = ?, error = COALESCE(?, error), updated_at = ? WHERE id = ?`)
-      .run(status, error ?? null, Date.now(), id);
+      .prepare(
+        clearError
+          ? `UPDATE sessions SET status = ?, error = NULL, updated_at = ? WHERE id = ?`
+          : `UPDATE sessions SET status = ?, error = COALESCE(?, error), updated_at = ? WHERE id = ?`,
+      )
+      .run(...(clearError ? [status, Date.now(), id] : [status, error ?? null, Date.now(), id]));
   }
 
   send(id: string, text: string): boolean {
@@ -324,6 +339,8 @@ export class SessionManager {
   }
 
   shutdown(): void {
+    // Set before aborting so in-flight catch blocks classify correctly.
+    this.#stopping = true;
     for (const live of this.#live.values()) live.abort.abort();
   }
 }

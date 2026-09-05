@@ -103,6 +103,28 @@ The subprocess itself never survives. `mirror_error` messages are logged and
 pushed to the bus rather than swallowed, because silent mirror failure means
 silently losing the ability to resume.
 
+## Scoping MCP servers
+
+Every session is its own subprocess with its own MCP servers, so inheriting a
+large user-level config multiplies across parallel sessions and is the fastest
+way to exhaust a small box.
+
+Point `AGENTD_MCP_CONFIG` at a file (either a bare map or the `{"mcpServers":
+{...}}` shape that `.mcp.json` uses) and sessions run with the SDK's
+`strictMcpConfig`, which ignores project `.mcp.json`, user settings, plugins and
+agent frontmatter. `settingSources` still loads `CLAUDE.md`, skills and
+commands -- the half worth inheriting. A session can then request a subset:
+
+```json
+{ "prompt": "...", "mcpServers": ["context7"] }
+```
+
+An unknown name is a 400 rather than a silent omission: a session that quietly
+starts without the server it asked for looks like a broken tool, which is an
+expensive thing to debug from a phone. With no config file the behaviour is
+unchanged -- inherit everything, which is right for one operator running one
+session.
+
 ## Setup
 
 ```bash
@@ -115,8 +137,9 @@ export CLAUDE_CODE_OAUTH_TOKEN=<token>
 npm start
 ```
 
-`deploy/agentd.service` is the systemd unit. Put the token in
-`/etc/agentd/claude.env` (mode 0640, root-owned) and nowhere else.
+`deploy/agentd.service` is the systemd unit and `deploy/README.md` is the full
+box-to-Home-Screen walkthrough, including the Tailscale perimeter. Put the token
+in `/etc/agentd/claude.env` (mode 0640, root-owned) and nowhere else.
 
 ### agentd refuses to start if the environment can bill you
 
@@ -170,21 +193,37 @@ this daemon as equivalent to SSH access.
 | `AGENTD_MODEL` | — | Claude Code default when unset |
 | `AGENTD_PUBLIC_DIR` | `../public` | PWA assets |
 | `AGENTD_PUSH_CONTACT` | `mailto:agentd@localhost` | VAPID `sub` claim |
+| `AGENTD_MCP_CONFIG` | — | MCP allowlist; enables `strictMcpConfig` |
 | `AGENTD_ALLOW_SIMULATE` | — | `1` enables the simulate route |
 
 ## Tests
 
 ```bash
-npm run build && bash test/smoke.sh
+npm run build && npm test          # both suites
+npm run test:fast                  # smoke only, no credential needed
 ```
 
-22 assertions covering the boot audit, park/resolve, rule auto-approval, TTL
-expiry, restart reaping, and the simulate route's default-off behaviour. The
+**`test/smoke.sh` — 22 assertions, hermetic.** Boot audit, park/resolve, rule
+auto-approval, TTL expiry, restart reaping, simulate-off-by-default. The
 simulate endpoint drives `ApprovalGate.request()` — the same function
 `canUseTool` calls — so the tested path is the real one, with no credential
 required and no tokens spent.
 
-Verified separately against live sessions, not simulations:
+**`test/extended.sh` — 32 assertions**, including live sessions, so it needs
+working credentials (`AGENTD_TEST_LIVE=0` skips those). MCP scoping, worktree
+isolation, untracked files in diffs, Web Push registration and VAPID
+persistence, the event socket, multi-turn input, transcript mirroring, and
+resume-after-restart.
+
+Two bugs this suite caught, both now fixed and guarded:
+
+- A session killed by daemon shutdown was recorded as `failed` with "exited with
+  code 143". The child is in agentd's process group, so it takes SIGTERM before
+  agentd's own abort fires and `abort.signal.aborted` is still false.
+- A stale `error` survived a successful resume, because `COALESCE(?, error)` can
+  only ever add an error, never retract one.
+
+Also verified by hand against live sessions:
 
 - A real `Bash` call parked on `canUseTool`, surfaced with the SDK's own
   `toolUseID` and `displayName`, was resolved over curl, and the session ran to
@@ -199,12 +238,14 @@ Verified separately against live sessions, not simulations:
 
 - **No auth.** Deliberate — Tailscale is the perimeter and this is single-user.
   Anything multi-user needs a real authn layer before it goes anywhere.
-- **No per-session MCP allowlist.** Every session is its own subprocess with its
-  own MCP servers. Heavy servers × parallel sessions will exhaust the box; the
-  SDK suggests ~1 GiB per agent as a floor, not a ceiling.
-- **Resume loses the in-flight turn.** The mirror holds completed entries; a
-  subprocess killed mid-tool-call cannot be restored to that instant.
-- **Diff is working-tree only** (`git diff HEAD`); untracked files do not appear.
+- **No memory ceiling.** `AGENTD_MCP_CONFIG` bounds the tool surface per
+  session, but nothing caps concurrent sessions. The SDK suggests ~1 GiB per
+  agent as a floor, not a ceiling; size the box before running many at once.
+- **Resume loses the in-flight turn.** The mirror holds completed entries, so a
+  subprocess killed mid-tool-call cannot be restored to that instant. Resuming
+  starts the next turn with full prior context, which is the recoverable part.
+- **Diff caps untracked files at 200** and the patch at 400 KB, flagging
+  `truncated` past either.
 - **`title` is not always populated** by the bridge — live testing saw both a
   populated `title` and a null one with only `displayName` — so every surface
   falls back through `title → description → toolName + primary input`.

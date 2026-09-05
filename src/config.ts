@@ -136,6 +136,8 @@ export interface Config {
   publicDir: string;
   /** VAPID `sub` claim. Must be a mailto: or https: URL. */
   pushContact: string;
+  /** Optional MCP allowlist. When set, sessions run with strictMcpConfig. */
+  mcpConfigPath: string | undefined;
 }
 
 function intFromEnv(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -163,5 +165,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxTurns: intFromEnv(env, "AGENTD_MAX_TURNS", 200),
     publicDir: resolve(env["AGENTD_PUBLIC_DIR"] ?? fileURLToPath(new URL("../public", import.meta.url))),
     pushContact: env["AGENTD_PUSH_CONTACT"] ?? "mailto:agentd@localhost",
+    mcpConfigPath: env["AGENTD_MCP_CONFIG"] ? resolve(env["AGENTD_MCP_CONFIG"]) : undefined,
   };
 }

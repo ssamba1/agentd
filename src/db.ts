@@ -114,7 +114,13 @@ CREATE TABLE app_config (
 );
 `;
 
-const MIGRATIONS: string[] = [V1, V2];
+const V3 = `
+-- Which MCP servers a session was started with, so a resume reproduces the
+-- same tool surface instead of silently widening it.
+ALTER TABLE sessions ADD COLUMN mcp_servers TEXT;
+`;
+
+const MIGRATIONS: string[] = [V1, V2, V3];
 const SCHEMA_VERSION = MIGRATIONS.length;
 
 export function openDb(path: string): Db {

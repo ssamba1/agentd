@@ -10,6 +10,7 @@ import type { Bus } from "./bus.js";
 import type { Config } from "./config.js";
 import { type Db, logEvent } from "./db.js";
 import type { ApprovalGate } from "./gate.js";
+import { type McpPolicy, selectServers } from "./mcp.js";
 import { prepareWorkspace } from "./worktree.js";
 
 /**
@@ -75,6 +76,8 @@ export interface StartSessionSpec {
   cwd?: string | undefined;
   repo?: string | undefined;
   branch?: string | undefined;
+  /** Subset of the configured MCP allowlist; omit for all of it. */
+  mcpServers?: string[] | undefined;
 }
 
 interface LiveSession {
@@ -89,19 +92,31 @@ export class SessionManager {
   readonly #gate: ApprovalGate;
   readonly #bus: Bus;
   readonly #store: SessionStore;
+  readonly #mcp: McpPolicy;
   readonly #live = new Map<string, LiveSession>();
 
-  constructor(db: Db, cfg: Config, gate: ApprovalGate, bus: Bus, store: SessionStore) {
+  constructor(
+    db: Db,
+    cfg: Config,
+    gate: ApprovalGate,
+    bus: Bus,
+    store: SessionStore,
+    mcp: McpPolicy,
+  ) {
     this.#db = db;
     this.#cfg = cfg;
     this.#gate = gate;
     this.#bus = bus;
     this.#store = store;
+    this.#mcp = mcp;
   }
 
   async start(spec: StartSessionSpec): Promise<string> {
     const id = randomUUID();
     const now = Date.now();
+    // Validate the MCP selection before doing anything with side effects, so a
+    // typo does not leave an orphaned worktree behind.
+    selectServers(this.#mcp, spec.mcpServers);
     const workspace = await prepareWorkspace({
       repo: spec.repo,
       branch: spec.branch,
@@ -113,8 +128,8 @@ export class SessionManager {
       .prepare(
         `INSERT INTO sessions
            (id, sdk_session_id, title, cwd, prompt, status, error, created_at, updated_at,
-            repo, branch, worktree, project_key)
-         VALUES (?, NULL, ?, ?, ?, 'starting', NULL, ?, ?, ?, ?, ?, NULL)`,
+            repo, branch, worktree, project_key, mcp_servers)
+         VALUES (?, NULL, ?, ?, ?, 'starting', NULL, ?, ?, ?, ?, ?, NULL, ?)`,
       )
       .run(
         id,
@@ -126,10 +141,11 @@ export class SessionManager {
         workspace.repo,
         workspace.branch,
         workspace.isWorktree ? 1 : 0,
+        spec.mcpServers ? JSON.stringify(spec.mcpServers) : null,
       );
 
     this.#bus.emit("session.created", id, { title: spec.title ?? spec.prompt.slice(0, 80) });
-    this.#launch(id, workspace.cwd, spec.prompt, undefined);
+    this.#launch(id, workspace.cwd, spec.prompt, undefined, spec.mcpServers);
     return id;
   }
 
@@ -141,20 +157,27 @@ export class SessionManager {
    */
   resume(id: string, prompt: string): void {
     const row = this.#db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(id) as
-      | { id: string; cwd: string; sdk_session_id: string | null }
+      | { id: string; cwd: string; sdk_session_id: string | null; mcp_servers: string | null }
       | undefined;
     if (!row) throw new Error("no such session");
     if (this.#live.has(id)) throw new Error("session is already running");
     if (!row.sdk_session_id) throw new Error("session has no transcript to resume from");
-    this.#launch(id, row.cwd, prompt, row.sdk_session_id);
+    const mcpServers = row.mcp_servers ? (JSON.parse(row.mcp_servers) as string[]) : undefined;
+    this.#launch(id, row.cwd, prompt, row.sdk_session_id, mcpServers);
   }
 
-  #launch(id: string, cwd: string, prompt: string, resumeFrom: string | undefined): void {
+  #launch(
+    id: string,
+    cwd: string,
+    prompt: string,
+    resumeFrom: string | undefined,
+    mcpServers: string[] | undefined,
+  ): void {
     const abort = new AbortController();
     const input = new InputQueue();
     this.#live.set(id, { id, abort, input });
     input.push(prompt);
-    void this.#run(id, cwd, input, abort, resumeFrom);
+    void this.#run(id, cwd, input, abort, resumeFrom, mcpServers);
   }
 
   async #run(
@@ -163,7 +186,9 @@ export class SessionManager {
     input: InputQueue,
     abort: AbortController,
     resumeFrom: string | undefined,
+    mcpServers: string[] | undefined,
   ): Promise<void> {
+    const mcp = selectServers(this.#mcp, mcpServers);
     const options: Options = {
       cwd,
       abortController: abort,
@@ -182,6 +207,12 @@ export class SessionManager {
       // Single-user box: the operator's own ~/.claude (CLAUDE.md, skills,
       // agents, local MCP servers) is wanted, not isolated away.
       settingSources: ["user", "project", "local"],
+
+      // With an allowlist configured, strictMcpConfig makes the SDK ignore
+      // project .mcp.json, user settings, plugins and agent frontmatter, so a
+      // session starts only the servers it was granted. settingSources still
+      // loads CLAUDE.md, skills and commands -- the half worth inheriting.
+      ...(mcp.strict ? { mcpServers: mcp.servers, strictMcpConfig: true } : {}),
 
       maxTurns: this.#cfg.maxTurns,
       ...(this.#cfg.model ? { model: this.#cfg.model } : {}),

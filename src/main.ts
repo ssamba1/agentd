@@ -4,6 +4,7 @@ import { auditCredentialEnvironment, CredentialEnvironmentError, loadConfig } fr
 import { openDb, reapOrphanedApprovals, reapOrphanedSessions } from "./db.js";
 import { ApprovalGate } from "./gate.js";
 import { createHttpServer } from "./http.js";
+import { loadMcpPolicy, McpConfigError } from "./mcp.js";
 import { createPtySocket } from "./pty.js";
 import { PushService } from "./push.js";
 import { SessionManager } from "./session.js";
@@ -31,7 +32,8 @@ function main(): void {
   const bus = new Bus();
   const gate = new ApprovalGate(db, bus, cfg.approvalTtlMs);
   const store = createSqliteSessionStore(db);
-  const sessions = new SessionManager(db, cfg, gate, bus, store);
+  const mcp = loadMcpPolicy(cfg.mcpConfigPath);
+  const sessions = new SessionManager(db, cfg, gate, bus, store, mcp);
   const push = new PushService(db, bus, cfg.pushContact);
   const server = createHttpServer({
     db,
@@ -40,6 +42,7 @@ function main(): void {
     sessions,
     push,
     publicDir: cfg.publicDir,
+    mcpNames: mcp.strict ? Object.keys(mcp.servers) : null,
     startedAt: Date.now(),
   });
 
@@ -77,7 +80,9 @@ function main(): void {
     console.log(`[agentd] db=${cfg.dbPath} approvalTtl=${cfg.approvalTtlMs / 1000}s`);
     console.log(
       `[agentd] auth=${audit.tokenPresent ? "CLAUDE_CODE_OAUTH_TOKEN" : "NONE (simulate only)"}` +
-        ` push=${push.enabled ? "on" : "off"}${cfg.allowSimulate ? " simulate=on" : ""}`,
+        ` push=${push.enabled ? "on" : "off"}` +
+        ` mcp=${mcp.strict ? `strict(${Object.keys(mcp.servers).length})` : "inherit"}` +
+        `${cfg.allowSimulate ? " simulate=on" : ""}`,
     );
   });
 
@@ -110,7 +115,7 @@ function main(): void {
 try {
   main();
 } catch (err) {
-  if (err instanceof CredentialEnvironmentError) {
+  if (err instanceof CredentialEnvironmentError || err instanceof McpConfigError) {
     console.error(`\n[agentd] ${err.message}\n`);
     process.exit(78); // EX_CONFIG
   }

@@ -5,6 +5,7 @@ import { extname, join, normalize, resolve as resolvePath } from "node:path";
 import type { Config } from "./config.js";
 import type { Db } from "./db.js";
 import type { ApprovalGate, MatchKind, RememberSpec } from "./gate.js";
+import { McpConfigError } from "./mcp.js";
 import type { PushService } from "./push.js";
 import type { SessionManager } from "./session.js";
 import { diffWorkspace, removeWorktree } from "./worktree.js";
@@ -87,6 +88,8 @@ function parseRemember(raw: unknown): RememberSpec | undefined {
 }
 
 export interface HttpDeps {
+  /** Configured MCP server names, or null when agentd inherits everything. */
+  mcpNames: string[] | null;
   db: Db;
   cfg: Config;
   gate: ApprovalGate;
@@ -99,7 +102,7 @@ export interface HttpDeps {
 type Handler = (m: RegExpMatchArray, req: IncomingMessage) => Promise<unknown> | unknown;
 
 export function createHttpServer(deps: HttpDeps): Server {
-  const { db, cfg, gate, sessions, push, publicDir } = deps;
+  const { db, cfg, gate, sessions, push, publicDir, mcpNames } = deps;
 
   const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
     {
@@ -143,14 +146,25 @@ export function createHttpServer(deps: HttpDeps): Server {
       pattern: /^\/api\/sessions$/,
       handle: async (_m, req) => {
         const body = await readJson(req);
-        const id = await sessions.start({
-          prompt: str(body, "prompt", true),
-          title: str(body, "title"),
-          cwd: str(body, "cwd"),
-          repo: str(body, "repo"),
-          branch: str(body, "branch"),
-        });
-        return { id };
+        const mcp = body["mcpServers"];
+        if (mcp !== undefined && (!Array.isArray(mcp) || mcp.some((x) => typeof x !== "string"))) {
+          throw new HttpError(400, "mcpServers must be an array of strings");
+        }
+        try {
+          return {
+            id: await sessions.start({
+              prompt: str(body, "prompt", true),
+              title: str(body, "title"),
+              cwd: str(body, "cwd"),
+              repo: str(body, "repo"),
+              branch: str(body, "branch"),
+              mcpServers: mcp as string[] | undefined,
+            }),
+          };
+        } catch (err) {
+          if (err instanceof McpConfigError) throw new HttpError(400, err.message);
+          throw err;
+        }
       },
     },
     {
@@ -282,6 +296,11 @@ export function createHttpServer(deps: HttpDeps): Server {
     },
 
     // --- rules ----------------------------------------------------------
+    {
+      method: "GET",
+      pattern: /^\/api\/mcp$/,
+      handle: () => ({ strict: mcpNames !== null, servers: mcpNames ?? [] }),
+    },
     {
       method: "GET",
       pattern: /^\/api\/rules$/,
